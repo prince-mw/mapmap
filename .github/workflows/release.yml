@@ -1,0 +1,248 @@
+# Create multi-platform release packages for MapMap
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.6.3)'
+        required: true
+        default: '0.6.3'
+
+jobs:
+  build-windows:
+    name: Build Windows Release
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: '5.15.2'
+        host: 'windows'
+        target: 'desktop'
+        arch: 'win64_mingw81'
+        modules: 'qtmultimedia qtwebengine'
+        tools: 'tools_mingw,qt.tools.win64_mingw810'
+
+    - name: Install GStreamer
+      shell: powershell
+      run: |
+        Write-Host "Installing GStreamer Runtime..." -ForegroundColor Cyan
+        $msiPath = "$env:TEMP\gstreamer-runtime.msi"
+        Invoke-WebRequest -Uri 'https://gstreamer.freedesktop.org/data/pkg/windows/1.22.0/mingw/gstreamer-1.0-mingw-x86_64-1.22.0.msi' -OutFile $msiPath
+        Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /quiet /norestart INSTALLDIR=C:\gstreamer" -Wait
+        
+        Write-Host "Installing GStreamer Development files..." -ForegroundColor Cyan
+        $msiDevPath = "$env:TEMP\gstreamer-devel.msi"
+        Invoke-WebRequest -Uri 'https://gstreamer.freedesktop.org/data/pkg/windows/1.22.0/mingw/gstreamer-1.0-devel-mingw-x86_64-1.22.0.msi' -OutFile $msiDevPath
+        Start-Process msiexec.exe -ArgumentList "/i `"$msiDevPath`" /quiet /norestart INSTALLDIR=C:\gstreamer" -Wait
+        
+        Write-Host "GStreamer installed successfully" -ForegroundColor Green
+
+    - name: Set environment variables
+      shell: bash
+      run: |
+        echo "GSTREAMER_1_0_ROOT_MINGW_X86_64=C:/gstreamer/1.0/mingw_x86_64" >> $GITHUB_ENV
+        echo "C:/gstreamer/1.0/mingw_x86_64/bin" >> $GITHUB_PATH
+
+    - name: Get version
+      id: version
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          VERSION="${{ github.event.inputs.version }}"
+        else
+          VERSION=$(cat VERSION.txt | tr -d '\n\r')
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Building version: $VERSION"
+
+    - name: Configure and Build
+      shell: bash
+      run: |
+        qmake mapmap.pro CONFIG+=release
+        mingw32-make -j$(nproc)
+
+    - name: Create Windows Package
+      shell: bash
+      run: |
+        VERSION="${{ steps.version.outputs.version }}"
+        PACKAGE_NAME="MapMap-${VERSION}-Windows-x64"
+        mkdir -p release/${PACKAGE_NAME}
+        
+        # Copy executable
+        cp release/mapmap.exe release/${PACKAGE_NAME}/MapMap.exe
+        
+        # Deploy Qt dependencies
+        windeployqt --release --no-translations release/${PACKAGE_NAME}/MapMap.exe
+        
+        # Copy GStreamer runtime DLLs (essential ones)
+        GSTREAMER_BIN="C:/gstreamer/1.0/mingw_x86_64/bin"
+        GSTREAMER_PLUGINS="C:/gstreamer/1.0/mingw_x86_64/lib/gstreamer-1.0"
+        
+        # Core GStreamer DLLs
+        for dll in gstreamer-1.0-0.dll gstbase-1.0-0.dll gstcontroller-1.0-0.dll \
+                   gstvideo-1.0-0.dll gstaudio-1.0-0.dll gstapp-1.0-0.dll \
+                   gstpbutils-1.0-0.dll gsttag-1.0-0.dll glib-2.0-0.dll \
+                   gobject-2.0-0.dll gmodule-2.0-0.dll gio-2.0-0.dll \
+                   intl-8.dll ffi-8.dll z-1.dll; do
+          if [ -f "${GSTREAMER_BIN}/${dll}" ]; then
+            cp "${GSTREAMER_BIN}/${dll}" release/${PACKAGE_NAME}/
+          fi
+        done
+        
+        # GStreamer plugins
+        mkdir -p release/${PACKAGE_NAME}/gstreamer-plugins
+        if [ -d "${GSTREAMER_PLUGINS}" ]; then
+          cp ${GSTREAMER_PLUGINS}/*.dll release/${PACKAGE_NAME}/gstreamer-plugins/ 2>/dev/null || true
+        fi
+        
+        # Copy documentation and license
+        cp README.md LICENSE INSTALL.md CHANGELOG.md release/${PACKAGE_NAME}/
+        
+        # Create installation instructions
+        cat > release/${PACKAGE_NAME}/WINDOWS_README.txt << 'EOF'
+MapMap for Windows
+==================
+
+Installation:
+1. Extract all files to a folder of your choice
+2. Run MapMap.exe
+
+Requirements:
+- Windows 10 or later (64-bit)
+- Graphics card with OpenGL support
+
+Troubleshooting:
+- If you encounter DLL errors, install the Visual C++ Redistributable:
+  https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+For more information, visit: https://mapmapteam.github.io/
+EOF
+        
+        # Create archive
+        cd release
+        7z a -tzip ${PACKAGE_NAME}.zip ${PACKAGE_NAME}
+        
+        ls -lh ${PACKAGE_NAME}.zip
+
+    - name: Upload Windows artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MapMap-Windows-x64-${{ steps.version.outputs.version }}
+        path: release/MapMap-*.zip
+        retention-days: 90
+
+    - name: Upload to Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/MapMap-*.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux:
+    name: Build Linux Release
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          liblo-dev qtbase5-dev qttools5-dev-tools qtmultimedia5-dev \
+          libqt5opengl5-dev qtwebengine5-dev libqt5multimedia5-plugins \
+          libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+          gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-plugins-good \
+          gstreamer1.0-plugins-ugly build-essential
+
+    - name: Get version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          VERSION="${{ github.event.inputs.version }}"
+        else
+          VERSION=$(cat VERSION.txt | tr -d '\n\r')
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Build
+      run: |
+        qmake mapmap.pro CONFIG+=release
+        make -j$(nproc)
+
+    - name: Create Linux Package
+      run: |
+        VERSION="${{ steps.version.outputs.version }}"
+        PACKAGE_NAME="MapMap-${VERSION}-Linux-x64"
+        mkdir -p release/${PACKAGE_NAME}
+        
+        cp mapmap release/${PACKAGE_NAME}/
+        cp README.md LICENSE INSTALL.md CHANGELOG.md release/${PACKAGE_NAME}/
+        
+        cd release
+        tar czf ${PACKAGE_NAME}.tar.gz ${PACKAGE_NAME}
+
+    - name: Upload Linux artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MapMap-Linux-x64-${{ steps.version.outputs.version }}
+        path: release/MapMap-*.tar.gz
+        retention-days: 90
+
+    - name: Upload to Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/MapMap-*.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  create-release-notes:
+    name: Create Release Notes
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Generate Release Notes
+      uses: softprops/action-gh-release@v1
+      with:
+        generate_release_notes: true
+        body: |
+          ## MapMap Release
+          
+          ### Downloads
+          - **Windows (64-bit)**: MapMap-*-Windows-x64.zip
+          - **Linux (64-bit)**: MapMap-*-Linux-x64.tar.gz
+          
+          ### Installation
+          
+          **Windows:**
+          1. Download and extract the Windows ZIP file
+          2. Run MapMap.exe
+          
+          **Linux:**
+          1. Download and extract the Linux tarball
+          2. Install dependencies (see INSTALL.md)
+          3. Run ./mapmap
+          
+          ### What's New
+          See CHANGELOG.md for detailed changes.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

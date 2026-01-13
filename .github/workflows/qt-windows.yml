@@ -1,34 +1,114 @@
-# Build a Qt project on Windows
+# Build MapMap on Windows with release packaging
 name: Build on Windows
 
 on:
   push:
-    branches: [ develop ]
+    branches: [ develop, master ]
+    tags:
+      - 'v*'
   pull_request:
-    branches: [ develop ]
+    branches: [ develop, master ]
 
 jobs:
   build:
-    if: false # Disable for now
-
-    runs-on: windows-2019
+    runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
+
     - name: Install Qt
-      uses: jurplel/install-qt-action@v2
+      uses: jurplel/install-qt-action@v4
       with:
-        version: '5.12.12'
+        version: '5.15.2'
         host: 'windows'
         target: 'desktop'
-        arch: 'win64_msvc2017_64'
-        modules: 'gui core serialport network opengl xml'
-    - name: qmake
-      run: qmake .
-    - name: make
-      run: make
-    - name: make check
-      run: make check
+        arch: 'win64_mingw81'
+        modules: 'qtmultimedia qtwebengine'
+        tools: 'tools_mingw,qt.tools.win64_mingw810'
 
-#    - name: make distcheck
-#      run: make distcheck
+    - name: Install GStreamer
+      shell: powershell
+      run: |
+        Write-Host "Installing GStreamer Runtime..." -ForegroundColor Cyan
+        $msiPath = "$env:TEMP\gstreamer-runtime.msi"
+        Invoke-WebRequest -Uri 'https://gstreamer.freedesktop.org/data/pkg/windows/1.22.0/mingw/gstreamer-1.0-mingw-x86_64-1.22.0.msi' -OutFile $msiPath
+        Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /quiet /norestart INSTALLDIR=C:\gstreamer" -Wait
+        
+        Write-Host "Installing GStreamer Development files..." -ForegroundColor Cyan
+        $msiDevPath = "$env:TEMP\gstreamer-devel.msi"
+        Invoke-WebRequest -Uri 'https://gstreamer.freedesktop.org/data/pkg/windows/1.22.0/mingw/gstreamer-1.0-devel-mingw-x86_64-1.22.0.msi' -OutFile $msiDevPath
+        Start-Process msiexec.exe -ArgumentList "/i `"$msiDevPath`" /quiet /norestart INSTALLDIR=C:\gstreamer" -Wait
+        
+        Write-Host "GStreamer installed successfully" -ForegroundColor Green
+
+    - name: Set environment variables
+      shell: bash
+      run: |
+        echo "GSTREAMER_1_0_ROOT_MINGW_X86_64=C:/gstreamer/1.0/mingw_x86_64" >> $GITHUB_ENV
+        echo "C:/gstreamer/1.0/mingw_x86_64/bin" >> $GITHUB_PATH
+
+    - name: Configure with qmake
+      shell: bash
+      run: |
+        qmake mapmap.pro CONFIG+=release
+
+    - name: Build
+      shell: bash
+      run: |
+        mingw32-make -j$(nproc)
+
+    - name: Get version
+      id: version
+      shell: bash
+      run: |
+        VERSION=$(cat VERSION.txt | tr -d '\n\r')
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+
+    - name: Prepare release package
+      shell: bash
+      run: |
+        VERSION="${{ steps.version.outputs.version }}"
+        PACKAGE_NAME="MapMap-${VERSION}-Windows-x64"
+        mkdir -p release/${PACKAGE_NAME}
+        
+        # Copy executable
+        cp release/mapmap.exe release/${PACKAGE_NAME}/
+        
+        # Copy Qt DLLs
+        windeployqt --release --no-translations release/${PACKAGE_NAME}/mapmap.exe
+        
+        # Copy GStreamer DLLs
+        mkdir -p release/${PACKAGE_NAME}/gstreamer-plugins
+        cp -r C:/gstreamer/1.0/mingw_x86_64/bin/*.dll release/${PACKAGE_NAME}/ || true
+        cp -r C:/gstreamer/1.0/mingw_x86_64/lib/gstreamer-1.0/*.dll release/${PACKAGE_NAME}/gstreamer-plugins/ || true
+        
+        # Copy documentation
+        cp README.md release/${PACKAGE_NAME}/
+        cp LICENSE release/${PACKAGE_NAME}/
+        cp INSTALL.md release/${PACKAGE_NAME}/
+        
+        # Create archive
+        cd release
+        7z a -tzip ${PACKAGE_NAME}.zip ${PACKAGE_NAME}
+        
+        echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MapMap-Windows-x64
+        path: release/*.zip
+        retention-days: 30
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/*.zip
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
